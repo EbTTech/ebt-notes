@@ -1,19 +1,18 @@
 """EBT Notes prototype (phone-first).
 
 Three ways in, one transcript out:
-  1. Online meeting: paste a Google Meet / Zoom / Teams link, a bot joins and transcribes (Recall.ai)
+  1. Online meeting: paste a Google Meet or Zoom link, a bot joins and transcribes (Vexa)
   2. Upload an audio or video file                                                   (AssemblyAI)
   3. Record a physical meeting or lecture with the phone mic                         (AssemblyAI)
 Then edit the transcript and press Summarize                                         (Google Gemini)
 
 Secrets (environment variables, never put them in the code):
   ASSEMBLYAI_API_KEY   needed for Upload and Room mic
-  RECALL_API_KEY       needed for the Online meeting bot
+  VEXA_API_KEY         needed for the Online meeting bot (from vexa.ai)
   GEMINI_API_KEY       needed for the Summarize button
   APP_PASSWORD         optional but recommended, stops strangers using your free credit
 Optional settings:
-  RECALL_REGION        default us-east-1. Must match the region where you created the Recall key
-                       (their pay-as-you-go signup uses us-west-2).
+  VEXA_API_BASE        default https://api.cloud.vexa.ai
   GEMINI_MODEL         default gemini-3.5-flash-lite
   LANGUAGE_CODE        default "en" for uploads/recordings. "auto" = auto-detect.
   BOT_NAME             name the bot shows in the meeting, default "EBT Notes"
@@ -21,7 +20,8 @@ Optional settings:
 import hmac
 import os
 from functools import wraps
-from urllib.parse import urlparse
+import re
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -33,7 +33,7 @@ app.config["MAX_CONTENT_LENGTH"] = 600 * 1024 * 1024  # 600 MB uploads
 AAI_BASE = "https://api.assemblyai.com/v2"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 LANGUAGE_CODE = os.environ.get("LANGUAGE_CODE", "en")
-RECALL_REGION = os.environ.get("RECALL_REGION", "us-east-1")
+VEXA_BASE = os.environ.get("VEXA_API_BASE", "https://api.cloud.vexa.ai").rstrip("/")
 DEFAULT_BOT_NAME = os.environ.get("BOT_NAME", "EBT Notes")
 
 # A pause longer than this inside one speaker's turn starts a new paragraph...
@@ -66,15 +66,15 @@ def aai_headers():
     return {"authorization": key}
 
 
-def recall_headers():
-    key = os.environ.get("RECALL_API_KEY", "")
+def vexa_headers():
+    key = os.environ.get("VEXA_API_KEY", "")
     if not key:
-        raise RuntimeError("RECALL_API_KEY is not set on the server.")
-    return {"Authorization": f"Token {key}", "Content-Type": "application/json"}
+        raise RuntimeError("VEXA_API_KEY is not set on the server.")
+    return {"X-API-Key": key, "Content-Type": "application/json"}
 
 
-def recall_url(path):
-    return f"https://{RECALL_REGION}.recall.ai/api/v1/{path}"
+def vexa_url(path):
+    return f"{VEXA_BASE}/{path.lstrip('/')}"
 
 
 def paragraphs_from_words(words):
@@ -128,40 +128,56 @@ def build_turns(transcript):
     return merge_turns(turns)
 
 
-def build_turns_from_recall(segments):
-    """Recall.ai transcript JSON -> same turn format. Speaker names come from the meeting itself."""
-    turns = []
-    for seg in segments or []:
-        name = ((seg.get("participant") or {}).get("name") or "").strip() or "Unknown speaker"
-        words = []
-        for w in seg.get("words") or []:
-            s = (w.get("start_timestamp") or {}).get("relative")
-            e = (w.get("end_timestamp") or {}).get("relative")
-            if s is None:
-                continue
-            words.append({"text": w.get("text", ""), "start": int(s * 1000), "end": int((e if e is not None else s) * 1000)})
-        if not words:
-            continue
-        turns.append(
-            {"speaker": name, "label": name, "start": words[0]["start"], "paragraphs": paragraphs_from_words(words)}
-        )
-    turns.sort(key=lambda t: t["start"])
-    return merge_turns(turns)
+def build_turns_from_vexa(segments):
+    """Vexa transcript segments -> same turn format. Speaker names come from the meeting itself.
+
+    Each segment: {speaker, text, start (seconds), end (seconds), completed, ...}
+    """
+    segs = [s for s in (segments or []) if (s.get("text") or "").strip() and s.get("completed", True) is not False]
+    segs.sort(key=lambda s: s.get("start") or 0)
+    turns, prev_end = [], None
+    for s in segs:
+        speaker = (s.get("speaker") or "").strip() or "Unknown speaker"
+        start = int((s.get("start") or 0) * 1000)
+        end = int((s.get("end") or s.get("start") or 0) * 1000)
+        text = s["text"].strip()
+        same = bool(turns) and turns[-1]["speaker"] == speaker
+        if same:
+            gap = start - prev_end if prev_end is not None else 0
+            last = turns[-1]["paragraphs"]
+            words_in_last = len(last[-1].split())
+            if gap > PARAGRAPH_GAP_MS or (words_in_last >= PARAGRAPH_MAX_WORDS and last[-1].rstrip().endswith((".", "?", "!"))):
+                last.append(text)
+            else:
+                last[-1] = last[-1] + " " + text
+        else:
+            turns.append({"speaker": speaker, "label": speaker, "start": start, "paragraphs": [text]})
+        prev_end = end
+    return turns
 
 
-ALLOWED_MEETING_HOSTS = (
-    "meet.google.com", "zoom.us", "zoom.com", "teams.microsoft.com", "teams.live.com",
-    "webex.com", "gotomeeting.com", "goto.com",
-)
+MEET_RE = re.compile(r"^/([a-z]{3}-[a-z]{4}-[a-z]{3})/?$", re.I)
+ZOOM_RE = re.compile(r"^/(?:j|wc/join)/(\d{9,12})/?$")
 
 
-def valid_meeting_url(url):
+def parse_meeting_url(url):
+    """Return (platform, native_meeting_id, passcode) or None. Supports Google Meet and Zoom."""
     try:
         p = urlparse(url)
     except ValueError:
-        return False
+        return None
+    if p.scheme != "https":
+        return None
     host = (p.hostname or "").lower()
-    return p.scheme == "https" and any(host == h or host.endswith("." + h) for h in ALLOWED_MEETING_HOSTS)
+    if host == "meet.google.com":
+        m = MEET_RE.match(p.path)
+        return ("google_meet", m.group(1).lower(), None) if m else None
+    if host == "zoom.us" or host.endswith(".zoom.us") or host == "zoom.com" or host.endswith(".zoom.com"):
+        m = ZOOM_RE.match(p.path)
+        if m:
+            pwd = (parse_qs(p.query).get("pwd") or [None])[0]
+            return ("zoom", m.group(1), pwd)
+    return None
 
 
 # ---------------------------------------------------------------- pages
@@ -196,7 +212,7 @@ def health():
     return jsonify(
         ok=True,
         assemblyai_key=bool(os.environ.get("ASSEMBLYAI_API_KEY")),
-        recall_key=bool(os.environ.get("RECALL_API_KEY")),
+        bot_key=bool(os.environ.get("VEXA_API_KEY")),
         gemini_key=bool(os.environ.get("GEMINI_API_KEY")),
         password_required=bool(os.environ.get("APP_PASSWORD")),
         bot_name=DEFAULT_BOT_NAME,
@@ -276,105 +292,134 @@ def status(job_id):
     return jsonify(status=st or "processing")
 
 
-# ---------------------------------------------------------------- online meeting bot (Recall.ai)
+# ---------------------------------------------------------------- online meeting bot (Vexa)
 
 @app.post("/api/bot/start")
 @need_password
 def bot_start():
     data = request.get_json(silent=True) or {}
     url = (data.get("meeting_url") or "").strip()
-    if not valid_meeting_url(url):
+    parsed = parse_meeting_url(url)
+    if not parsed:
         return jsonify(
-            error="That does not look like a Google Meet, Zoom or Teams link. Paste the full link starting with https://"
+            error="That does not look like a Google Meet or Zoom link. Paste the full link starting with https:// "
+                  "(Google Meet links look like https://meet.google.com/abc-defg-hij)."
         ), 400
+    platform, native_id, passcode = parsed
     name = (data.get("bot_name") or DEFAULT_BOT_NAME).strip()[:60] or DEFAULT_BOT_NAME
 
-    body = {
-        "meeting_url": url,
-        "bot_name": name,
-        "recording_config": {"transcript": {"provider": {"recallai_streaming": {}}}},
-    }
+    body = {"platform": platform, "native_meeting_id": native_id, "bot_name": name}
+    if platform == "zoom":
+        body["meeting_url"] = url
+        if passcode:
+            body["passcode"] = passcode
+
     try:
-        r = requests.post(recall_url("bot"), headers=recall_headers(), json=body, timeout=60)
+        r = requests.post(vexa_url("bots"), headers=vexa_headers(), json=body, timeout=60)
     except RuntimeError as e:
         return jsonify(error=str(e)), 500
     except requests.RequestException as e:
         return jsonify(error=f"Could not reach the meeting-bot service: {e}"), 502
 
+    if r.status_code == 409:
+        # A bot is already in this meeting: just keep following it.
+        return jsonify(id=f"{platform}:{native_id}", note="A bot is already in this meeting.")
+    if r.status_code in (401, 403):
+        return jsonify(error=f"The meeting-bot service refused the request ({r.status_code}). Check VEXA_API_KEY, and your plan limits."), 502
     if r.status_code >= 400:
         return jsonify(error=f"Meeting-bot service said: {r.text[:300]}"), 502
-    return jsonify(id=r.json()["id"])
+    return jsonify(id=f"{platform}:{native_id}")
 
 
 BOT_MESSAGES = {
-    "joining_call": "The bot is joining the meeting. If you are the host, admit it when it knocks.",
-    "in_waiting_room": "The bot is in the waiting room. The host must admit it.",
-    "in_call_not_recording": "The bot is in the meeting and getting ready to listen.",
-    "in_call_recording": "The bot is in the meeting and transcribing.",
-    "recording_permission_allowed": "The bot is in the meeting and transcribing.",
-    "call_ended": "The meeting has ended. Preparing the transcript…",
+    "requested": "The bot has been requested and is getting ready.",
+    "joining": "The bot is joining the meeting. If you are the host, admit it when it knocks.",
+    "awaiting_admission": "The bot is waiting to be admitted. The host must let it in.",
+    "needs_help": "The bot needs help joining. Check the meeting and admit it.",
+    "active": "The bot is in the meeting and transcribing.",
+    "stopping": "The bot is leaving. Preparing the transcript…",
 }
+
+
+def split_bot_id(bot_id):
+    platform, _, native = bot_id.partition(":")
+    if platform not in ("google_meet", "zoom") or not native or "/" in native:
+        return None
+    return platform, native
+
+
+def find_meeting(platform, native_id):
+    """Look up this meeting in the user's meeting list. Returns the record or None."""
+    r = requests.get(vexa_url("meetings"), headers=vexa_headers(), params={"limit": 50}, timeout=60)
+    if r.status_code >= 400:
+        return None
+    data = r.json()
+    items = data if isinstance(data, list) else (data.get("meetings") or data.get("items") or data.get("data") or [])
+    for m in items:
+        if isinstance(m, dict) and m.get("platform") == platform and str(m.get("native_meeting_id")) == native_id:
+            return m  # newest first is the usual order, so the first match is the latest
+    return None
 
 
 @app.get("/api/bot/<bot_id>")
 @need_password
 def bot_status(bot_id):
+    ids = split_bot_id(bot_id)
+    if not ids:
+        return jsonify(error="Unknown meeting id."), 400
+    platform, native_id = ids
+    final = request.args.get("final") == "1"  # the page sets this after you press "Stop bot now"
+
     try:
-        r = requests.get(recall_url(f"bot/{bot_id}/"), headers=recall_headers(), timeout=60)
+        meeting = find_meeting(platform, native_id)
+        status = (meeting or {}).get("status")
+
+        if status == "failed":
+            reason = (meeting.get("data") or {}).get("completion_reason") or meeting.get("completion_reason")
+            return jsonify(
+                status="error",
+                error="The bot could not stay in the meeting" + (f" ({reason})" if reason else "")
+                + ". Check the link, that the meeting has started, and that the host admitted the bot.",
+            )
+
+        if status == "completed" or final:
+            tr = requests.get(vexa_url(f"transcripts/{platform}/{native_id}"), headers=vexa_headers(), timeout=120)
+            if tr.status_code == 404:
+                if status == "completed":
+                    return jsonify(status="error", error="The meeting ended but no transcript was found. Was anyone speaking?")
+                return jsonify(status="stopping", message=BOT_MESSAGES["stopping"])
+            if tr.status_code >= 400:
+                return jsonify(status="error", error=f"Meeting-bot service said: {tr.text[:300]}")
+            turns = build_turns_from_vexa(tr.json().get("segments"))
+            if turns:
+                return jsonify(status="completed", turns=turns)
+            if status == "completed":
+                return jsonify(status="error", error="The transcript was empty. Was anyone speaking?")
+            return jsonify(status="stopping", message=BOT_MESSAGES["stopping"])
     except RuntimeError as e:
         return jsonify(error=str(e)), 500
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError) as e:
         return jsonify(error=f"Could not reach the meeting-bot service: {e}"), 502
 
-    if r.status_code >= 400:
-        return jsonify(error=f"Meeting-bot service said: {r.text[:300]}"), 502
-
-    bot = r.json()
-    changes = bot.get("status_changes") or []
-    last = changes[-1] if changes else {}
-    code = last.get("code") or "joining_call"
-    sub = last.get("sub_code")
-
-    if code == "fatal":
-        return jsonify(
-            status="error",
-            error="The bot could not join the meeting"
-            + (f" ({sub})" if sub else "")
-            + ". Check the link, and that the meeting has started and the host admits guests.",
-        )
-
-    if code == "done":
-        url = None
-        for rec in bot.get("recordings") or []:
-            url = (((rec.get("media_shortcuts") or {}).get("transcript") or {}).get("data") or {}).get("download_url")
-            if url:
-                break
-        if not url:
-            return jsonify(status="error", error="The meeting ended but no transcript was produced. Was anyone speaking?")
-        try:
-            tr = requests.get(url, timeout=120)  # pre-signed URL, no auth header
-            tr.raise_for_status()
-            turns = build_turns_from_recall(tr.json())
-        except (requests.RequestException, ValueError) as e:
-            return jsonify(status="error", error=f"Could not download the transcript: {e}")
-        if not turns:
-            return jsonify(status="error", error="The transcript was empty. Was anyone speaking?")
-        return jsonify(status="completed", turns=turns)
-
+    code = status or "requested"
     return jsonify(status=code, message=BOT_MESSAGES.get(code, "Working…"))
 
 
 @app.post("/api/bot/<bot_id>/leave")
 @need_password
 def bot_leave(bot_id):
-    """Ask the bot to leave the call now (the transcript is then prepared as usual)."""
+    """Ask the bot to leave the call now. The transcript is then collected as usual."""
+    ids = split_bot_id(bot_id)
+    if not ids:
+        return jsonify(error="Unknown meeting id."), 400
+    platform, native_id = ids
     try:
-        r = requests.post(recall_url(f"bot/{bot_id}/leave_call/"), headers=recall_headers(), json={}, timeout=60)
+        r = requests.delete(vexa_url(f"bots/{platform}/{native_id}"), headers=vexa_headers(), timeout=60)
     except RuntimeError as e:
         return jsonify(error=str(e)), 500
     except requests.RequestException as e:
         return jsonify(error=f"Could not reach the meeting-bot service: {e}"), 502
-    if r.status_code >= 400:
+    if r.status_code >= 400 and r.status_code != 404:
         return jsonify(error=f"Meeting-bot service said: {r.text[:300]}"), 502
     return jsonify(ok=True)
 

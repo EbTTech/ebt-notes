@@ -87,7 +87,7 @@
 
     <!-- 1: online meeting via bot -->
     <div class="card panel" data-panel="online">
-      <strong>Google Meet, Zoom or Teams</strong>
+      <strong>Google Meet or Zoom</strong>
       <p class="hint">Paste the meeting link. A bot joins as a participant and transcribes. It works from any phone, because nothing runs on your phone.</p>
       <label class="lbl" for="meetUrl">Meeting link</label>
       <input type="url" id="meetUrl" inputmode="url" placeholder="https://meet.google.com/abc-defg-hij">
@@ -182,7 +182,7 @@
 
     <div class="row"><button class="btn ghost hidden" id="installBtn">Install EBT Notes on this phone</button></div>
     <div class="small" id="iosHint" style="margin:6px 0"></div>
-    <div class="small" style="margin:14px 0">Tell everyone in the meeting that it is being recorded. Meeting audio goes to Recall.ai (bot) or AssemblyAI (uploads and recordings) for transcription, and the text goes to Google Gemini for the summary. Nothing is stored on this server.</div>
+    <div class="small" style="margin:14px 0">Tell everyone in the meeting that it is being recorded. Meeting audio goes to Vexa (bot) or AssemblyAI (uploads and recordings) for transcription, and the text goes to Google Gemini for the summary. Nothing is stored on this server.</div>
   </div>
 </div>
 
@@ -225,7 +225,7 @@
       if (health.password_required && !password) { showGate(''); return; }
       if (health.password_required) { await api('/api/check', { method: 'POST' }); }
       showApp();
-      if (!health.recall_key) $('botErr').textContent = 'The online-meeting bot is not set up on this server yet (RECALL_API_KEY missing).';
+      if (!health.bot_key) $('botErr').textContent = 'The online-meeting bot is not set up on this server yet (VEXA_API_KEY missing).';
       if (!health.assemblyai_key) $('tErr').textContent = 'Uploads and recordings are not set up on this server yet (ASSEMBLYAI_API_KEY missing).';
       resumeBot();
     } catch (e) { if (e.message !== 'Password needed') showApp(); }
@@ -286,12 +286,13 @@
   async function trackBot(id, started) {
     if (botPolling) return;
     botPolling = true;
+    let stopped = false;
     setBotCard(true); $('botErr2').textContent = ''; $('botMsg').textContent = 'Sending the bot…';
     clearInterval(botTimerHandle);
     botTimerHandle = setInterval(() => { $('botTimer').textContent = fmtTime((Date.now() - started) / 1000); }, 1000);
     $('botLeave').onclick = async () => {
       $('botLeave').disabled = true;
-      try { await api('/api/bot/' + id + '/leave', { method: 'POST' }); $('botMsg').textContent = 'Stopping the bot…'; }
+      try { await api('/api/bot/' + encodeURIComponent(id) + '/leave', { method: 'POST' }); stopped = true; $('botMsg').textContent = 'Stopping the bot…'; }
       catch (e) { $('botErr2').textContent = e.message || String(e); }
       finally { $('botLeave').disabled = false; }
     };
@@ -300,7 +301,7 @@
     let failures = 0;
     while (botPolling) {
       try {
-        const r = await api('/api/bot/' + id);
+        const r = await api('/api/bot/' + encodeURIComponent(id) + (stopped ? '?final=1' : ''));
         failures = 0;
         if (r.status === 'completed') { lsDel('mn_bot'); stopBotUi(); botPolling = false; loadTranscript(r.turns); return; }
         if (r.status === 'error') { lsDel('mn_bot'); stopBotUi(); botPolling = false; setBotCard(false); $('botErr').textContent = r.error; return; }
